@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(uv run:*)",
+      "Bash(uv add:*)",
+      "Bash(pnpm add:*)",
+      "Bash(export:*)"
+    ]
+  }
+}

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+
+# Data files
+*.parquet
+*.zip
+*.zip.lock
+*.zip.metadata
+
+# Cache
+.cache/
+
+# Debug outputs
+debug_*.jpg
+debug_*.png
+
+# uv binary
+dataloader/uv
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+
+# Claude
+**/.claude/settings.local.json
