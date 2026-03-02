@@ -16,6 +16,8 @@ interface Frame {
 interface EgomotionData { log_id: string; frames: Frame[]; }
 interface LidarSpin { t: number; ef: number; pts: number[]; rgb?: number[]; }
 interface LidarData { log_id: string; spins: LidarSpin[]; }
+interface CameraEntry { file: string; fps: number; ego_to_frame: number[]; }
+interface CameraIndex { log_id: string; cameras: { front: CameraEntry; left: CameraEntry; right: CameraEntry; }; }
 
 // ── coordinate helpers ─────────────────────────────────────────────────────
 // Data coords passed through directly; camera is oriented to taste.
@@ -38,6 +40,27 @@ function speed(vx: number, vy: number, vz: number) {
   return Math.sqrt(vx * vx + vy * vy + vz * vz);
 }
 
+// ── diagnostic helper ─────────────────────────────────────────────────────
+declare global { interface Window { debugCamera?: () => void; } }
+if (typeof window !== "undefined") {
+  window.debugCamera = () => {
+    fetch("/camera_index.json").then(r => r.json()).then(d => {
+      console.log("=== CAMERA INDEX ===");
+      console.log("Log ID:", d.log_id);
+      for (const [name, entry] of Object.entries(d.cameras)) {
+        const e = entry as any;
+        console.log(`${name}:`, {
+          file: e.file,
+          fps: e.fps,
+          ego_to_frame_len: e.ego_to_frame.length,
+          ego_to_frame_min: Math.min(...e.ego_to_frame),
+          ego_to_frame_max: Math.max(...e.ego_to_frame),
+        });
+      }
+    }).catch(err => console.error("Failed to fetch camera_index.json:", err));
+  };
+}
+
 // ── component ──────────────────────────────────────────────────────────────
 export default function Home() {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -49,6 +72,13 @@ export default function Home() {
   const [keepPoints, setKeepPoints] = useState(false);
   const [rotateFollow, setRotateFollow] = useState(false);
   const [displayMode, setDisplayMode] = useState<"car" | "arrow">("car");
+
+  // Camera state and refs
+  const [camIdx, setCamIdx] = useState<CameraIndex | null>(null);
+  const frontVideoRef = useRef<HTMLVideoElement>(null);
+  const leftVideoRef  = useRef<HTMLVideoElement>(null);
+  const rightVideoRef = useRef<HTMLVideoElement>(null);
+  const camIdxRef = useRef<CameraIndex | null>(null);
 
   // Three.js object refs (set during scene init, used during frame updates)
   const carRef = useRef<THREE.Group | null>(null);
@@ -80,16 +110,111 @@ export default function Home() {
   useEffect(() => { displayModeRef.current = displayMode; }, [displayMode]);
   useEffect(() => { egoRef.current = ego; }, [ego]);
   useEffect(() => { lidarRef.current = lidar; }, [lidar]);
+  useEffect(() => { camIdxRef.current = camIdx; }, [camIdx]);
 
   // load data
   useEffect(() => {
     fetch("/egomotion.json").then(r => r.json()).then(setEgo);
     fetch("/lidar.json").then(r => r.json()).then(setLidar);
+    fetch("/camera_index.json")
+      .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+      .then(setCamIdx).catch(() => {});   // optional — app works without it
   }, []);
+
+  // attach video event listeners for debugging
+  useEffect(() => {
+    const videos = [
+      [frontVideoRef, "front"],
+      [leftVideoRef, "left"],
+      [rightVideoRef, "right"],
+    ];
+
+    videos.forEach(([ref, label]) => {
+      const el = ref.current;
+      if (!el) return;
+
+      const log = (evt: string) => {
+        console.log(`${label} ${evt}: readyState=${el.readyState}, duration=${el.duration.toFixed(2)}s, buffered=${el.buffered.length > 0 ? `0-${el.buffered.end(el.buffered.length - 1).toFixed(1)}s` : 'none'}`);
+      };
+
+      el.addEventListener("loadstart", () => log("loadstart"));
+      el.addEventListener("progress", () => log("progress"));
+      el.addEventListener("canplay", () => log("canplay"));
+      el.addEventListener("canplaythrough", () => log("canplaythrough"));
+      el.addEventListener("loadeddata", () => log("loadeddata"));
+      el.addEventListener("loadedmetadata", () => log("loadedmetadata"));
+      el.addEventListener("seeking", () => log("seeking"));
+      el.addEventListener("seeked", () => log("seeked"));
+      el.addEventListener("stalled", () => log("stalled"));
+      el.addEventListener("suspend", () => log("suspend"));
+    });
+  }, []);
+
+  // synchronize camera video playback with frame index
+  useEffect(() => {
+    if (!camIdx) return;
+    const pairs: [React.RefObject<HTMLVideoElement>, CameraEntry, string][] = [
+      [frontVideoRef, camIdx.cameras.front, "front"],
+      [leftVideoRef,  camIdx.cameras.left, "left"],
+      [rightVideoRef, camIdx.cameras.right, "right"],
+    ];
+
+    // Log state every 100 frames for debugging
+    const shouldLog = frameIdx % 100 === 0;
+    if (shouldLog) {
+      console.log(`[Frame ${frameIdx}]`);
+    }
+
+    for (const [ref, entry, label] of pairs) {
+      const el = ref.current;
+      if (!el) {
+        if (shouldLog) console.log(`  ${label}: no ref`);
+        continue;
+      }
+
+      // Bounds check: frameIdx should be within ego_to_frame length
+      if (frameIdx >= entry.ego_to_frame.length) {
+        if (shouldLog) console.log(`  ${label}: frameIdx ${frameIdx} >= ego_to_frame.length ${entry.ego_to_frame.length}`);
+        continue;
+      }
+
+      const frameNum = entry.ego_to_frame[frameIdx];
+      const t = frameNum / entry.fps;
+
+      // Log video state
+      if (shouldLog) {
+        console.log(`  ${label}: readyState=${el.readyState}, duration=${el.duration.toFixed(2)}s, currentTime=${el.currentTime.toFixed(2)}s, targetTime=${t.toFixed(2)}s, buffered=[${el.buffered.length > 0 ? `0-${el.buffered.end(el.buffered.length - 1).toFixed(1)}s` : 'none'}]`);
+      }
+
+      // Only seek if video is ready and time is valid
+      if (!isNaN(t) && isFinite(t) && el.readyState >= 2 && el.duration > 0) {
+        // Clamp seek time to video duration to prevent seeking past EOF
+        const clampedT = Math.min(t, el.duration - 0.01);
+        const threshold = 0.5 / entry.fps;
+        if (Math.abs(el.currentTime - clampedT) > threshold) {
+          try {
+            el.currentTime = clampedT;
+            if (shouldLog) console.log(`    → seeked to ${clampedT.toFixed(2)}s`);
+          } catch (e) {
+            if (shouldLog) console.warn(`    → seek failed:`, e);
+          }
+        }
+      } else if (shouldLog) {
+        console.log(`    → not seeking (isNaN=${isNaN(t)}, isFinite=${isFinite(t)}, readyState=${el.readyState}, duration=${el.duration})`);
+      }
+    }
+  }, [frameIdx, camIdx]);
 
   // keypress
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.key === "p" || e.key === "P") {
+        e.preventDefault();
+        setPlaying(p => {
+          if (!p && ego && frameIdx >= ego.frames.length - 1) setFrameIdx(0);
+          return !p;
+        });
+      }
       if (e.key === "d" || e.key === "D") {
         setDisplayMode(prev => prev === "car" ? "arrow" : "car");
       }
@@ -119,7 +244,7 @@ export default function Home() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [ego, frameIdx]);
 
   // animation playback
   useEffect(() => {
@@ -478,16 +603,40 @@ export default function Home() {
 
   return (
     <div className="flex flex-col items-center min-h-screen bg-slate-950 text-slate-100 p-6 gap-4">
-      <h1 className="text-2xl font-bold tracking-tight">Egomotion + LiDAR — 3D</h1>
+      <h1 className="text-2xl font-bold tracking-tight">NVIDIA Physical AI AV Visualization</h1>
 
-      <div
-        ref={mountRef}
-        className="w-full max-w-[900px] rounded-2xl border border-slate-800 shadow-2xl overflow-hidden"
-        style={{ height: 520 }}
-      />
+      <div className="flex flex-row gap-4 w-full max-w-[1400px] items-stretch">
+        {/* 3D canvas */}
+        <div
+          ref={mountRef}
+          className="flex-1 min-w-0 rounded-2xl border border-slate-800 shadow-2xl overflow-hidden"
+          style={{ height: 520 }}
+        />
+
+        {/* camera column */}
+        <div className="flex flex-col gap-2 w-[320px] shrink-0">
+          {camIdx ? (
+            [
+              { ref: frontVideoRef, label: "Front", entry: camIdx.cameras.front  },
+              { ref: leftVideoRef,  label: "Left",  entry: camIdx.cameras.left   },
+              { ref: rightVideoRef, label: "Right", entry: camIdx.cameras.right  },
+            ].map(({ ref, label, entry }) => (
+              <div key={label} className="relative flex-1 rounded-lg overflow-hidden border border-slate-700 bg-slate-900">
+                <video ref={ref} src={`/${entry.file}`} preload="metadata" muted playsInline
+                       className="w-full h-full object-cover" crossOrigin="anonymous" />
+                <span className="absolute top-1 left-2 text-xs text-slate-400 font-mono">{label}</span>
+              </div>
+            ))
+          ) : (
+            <div className="flex-1 rounded-lg border border-slate-800 bg-slate-900 flex items-center justify-center text-slate-600 text-xs font-mono">
+              No camera data<br/>Run export_camera.py
+            </div>
+          )}
+        </div>
+      </div>
 
       {/* controls */}
-      <div className="flex items-center gap-4 w-full max-w-[900px]">
+      <div className="flex items-center gap-4 w-full max-w-[1400px]">
         <button
           onClick={() => {
             if (ego && frameIdx >= ego.frames.length - 1) setFrameIdx(0);
@@ -543,7 +692,7 @@ export default function Home() {
 
       {/* stats */}
       {cur && (
-        <div className="grid grid-cols-5 gap-2 w-full max-w-[900px] text-xs font-mono">
+        <div className="grid grid-cols-5 gap-2 w-full max-w-[1400px] text-xs font-mono">
           {(
             [
               ["Accel X", `${cur.ax.toFixed(3)} m/s\u00b2`],
@@ -561,7 +710,7 @@ export default function Home() {
         </div>
       )}
 
-      <p className="text-xs text-slate-600 font-mono">drag to orbit · scroll to zoom · right-drag to pan · <kbd className="bg-slate-800 text-slate-400 px-1 rounded">D</kbd> toggle car / arrow · <kbd className="bg-slate-800 text-slate-400 px-1 rounded">R</kbd> follow cam · <kbd className="bg-slate-800 text-slate-400 px-1 rounded">K</kbd> keep points</p>
+      <p className="text-xs text-slate-600 font-mono">drag to orbit · scroll to zoom · right-drag to pan · <kbd className="bg-slate-800 text-slate-400 px-1 rounded">P</kbd> play/pause · <kbd className="bg-slate-800 text-slate-400 px-1 rounded">D</kbd> toggle car / arrow · <kbd className="bg-slate-800 text-slate-400 px-1 rounded">R</kbd> follow cam · <kbd className="bg-slate-800 text-slate-400 px-1 rounded">K</kbd> keep points</p>
     </div>
   );
 }
